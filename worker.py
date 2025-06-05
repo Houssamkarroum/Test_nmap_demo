@@ -11,6 +11,7 @@
 import os               # For accessing environment variables and process ID.
 import time             # For delays and timestamps.
 import redis            # Python client for Redis.
+import sys
 import random           # For simulating random scan outcomes.
 import psycopg2         # PostgreSQL adapter for Python.
 import ipaddress        # For IP address and network manipulation.
