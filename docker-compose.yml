@@ -1,0 +1,154 @@
+# docker-compose.yml
+# This file orchestrates your distributed Nmap scanning Proof of Concept (PoC)
+# with integrated Prometheus monitoring.
+
+version: '3.8'
+
+services:
+  # Orchestrator Service:
+  # Generates scan tasks and pushes them to Redis. Now exposes its own metrics.
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    depends_on:
+      - redis # Ensure Redis is up before the orchestrator.
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PROMETHEUS_METRICS_PORT: 8000 # Port for orchestrator's Prometheus metrics endpoint.
+    ports:
+      # Expose orchestrator's metrics port for Prometheus to scrape, if Prometheus is outside Docker,
+      # or for direct inspection. Within Docker, Prometheus can reach it via internal network.
+      - "8000:8000"
+
+  # Redis Service:
+  # The central message queue.
+  redis:
+    image: redis:latest
+    container_name: poc_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  # Redis Exporter Service:
+  # A Prometheus exporter that scrapes metrics directly from the Redis server.
+  # Provides insights into Redis's performance, memory usage, and queue lengths.
+  redis-exporter:
+    image: oliver006/redis_exporter:latest # Official Redis Exporter image.
+    container_name: poc_redis_exporter
+    environment:
+      # Specify the Redis server to monitor. 'redis:6379' refers to the Redis service within Docker.
+      REDIS_ADDR: redis:6379
+    ports:
+      # Expose exporter's metrics port (default 9121) for Prometheus to scrape.
+      - "9121:9121"
+    depends_on:
+      - redis # Ensures Redis is up before its exporter tries to connect.
+    restart: always
+
+  # Worker Service:
+  # Performs simulated scans and stores results. Now exposes its own metrics.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nmap_results
+      POSTGRES_USER: nmap_user
+      POSTGRES_PASSWORD: nmap_password
+      WORKER_THREADS: 10
+      PROMETHEUS_METRICS_PORT: 8001 # Port for worker's Prometheus metrics endpoint.
+    ports:
+      # Expose worker's metrics port. Since there are multiple workers, you'll see multiple
+      # container ports mapped, typically dynamically, but Prometheus can reach them internally.
+      # Exposing for direct inspection here, but not strictly necessary for internal scraping.
+      - "8001-8003:8001" # Example for a few workers, actual depends on replicas.
+                         # Prometheus scrapes them via service discovery.
+    deploy:
+      replicas: 3
+    restart: on-failure
+
+  # PostgreSQL Service:
+  # The database for storing scan results.
+  postgres:
+    image: postgres:13
+    container_name: poc_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: nmap_results
+      POSTGRES_USER: nmap_user
+      POSTGRES_PASSWORD: nmap_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  # PostgreSQL Exporter Service:
+  # A Prometheus exporter for PostgreSQL metrics. Provides database connection stats,
+  # query performance, and other PostgreSQL-specific insights.
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest # Official PostgreSQL Exporter image.
+    container_name: poc_postgres_exporter
+    environment:
+      # Connection string for the PostgreSQL exporter.
+      # 'postgres' is the service name, and 'nmap_results' is the database.
+      DATA_SOURCE_NAME: postgresql://nmap_user:nmap_password@postgres:5432/nmap_results?sslmode=disable
+    ports:
+      # Expose exporter's metrics port (default 9187) for Prometheus to scrape.
+      - "9187:9187"
+    depends_on:
+      - postgres # Ensures PostgreSQL is up before its exporter tries to connect.
+    restart: always
+
+  # Prometheus Service:
+  # The core monitoring system that scrapes and stores time-series metrics.
+  # It will pull metrics from orchestrator, workers, redis-exporter, and postgres-exporter.
+  prometheus:
+    image: prom/prometheus:latest # Official Prometheus Docker image.
+    container_name: poc_prometheus
+    ports:
+      - "9090:9090" # Expose Prometheus web UI on host port 9090.
+    volumes:
+      # Mounts the custom Prometheus configuration file into the container.
+      # This file defines what targets Prometheus should scrape.
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      # Specifies the command to run Prometheus with the mounted configuration.
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus' # Path for Prometheus data storage.
+    depends_on:
+      # Ensures all exporters and instrumented applications are up before Prometheus starts scraping.
+      - orchestrator
+      - worker
+      - redis-exporter
+      - postgres-exporter
+    restart: always
+
+  # Grafana Service:
+  # Data visualization and dashboarding. Now connects to both PostgreSQL (for results)
+  # and Prometheus (for operational metrics).
+  grafana:
+    image: grafana/grafana:latest
+    container_name: poc_grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres # For scan results data.
+      - prometheus # For operational metrics.
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: password
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: always
+
+# Define named volumes for persistent data storage.
+volumes:
+  postgres_data:
+  grafana_data:

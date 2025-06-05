@@ -1,0 +1,54 @@
+# prometheus.yml
+# This is the configuration file for the Prometheus server.
+# It defines scrape jobs to collect metrics from various services in your Docker Compose setup.
+
+# Global Prometheus configuration.
+global:
+  scrape_interval: 15s # Default scrape interval for all jobs.
+  evaluation_interval: 15s # How often rules are evaluated.
+
+# Rule files for alerting (not used in this basic PoC, but good to know).
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A list of scrape configurations. Each configuration defines a set of targets
+# and how Prometheus should scrape metrics from them.
+scrape_configs:
+  # --- Prometheus's own metrics ---
+  - job_name: 'prometheus'
+    # Default target for Prometheus itself (its own metrics endpoint).
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # --- Orchestrator Application Metrics ---
+  # Scrapes custom application metrics exposed by the orchestrator service.
+  - job_name: 'orchestrator'
+    # Targets are dynamically discovered based on the 'orchestrator' service in Docker Compose.
+    # Prometheus will look for containers named 'poc_orchestrator' or similar.
+    # The 'orchestrator' service is defined in docker-compose.yml, and Prometheus
+    # can resolve 'orchestrator' to its internal IP.
+    static_configs:
+      - targets: ['orchestrator:8000'] # 'orchestrator' is the service name, 8000 is the metrics port.
+
+  # --- Worker Application Metrics ---
+  # Scrapes custom application metrics exposed by each worker service instance.
+  # Since there are multiple worker replicas, Prometheus automatically discovers them
+  # by targeting the 'worker' service name. Docker's internal DNS will load-balance
+  # or provide IPs for all instances.
+  - job_name: 'worker'
+    static_configs:
+      - targets: ['worker:8001'] # 'worker' is the service name, 8001 is the metrics port.
+                                 # Prometheus will scrape all instances exposed on this port.
+
+  # --- Redis Exporter Metrics ---
+  # Scrapes metrics about the Redis server from the dedicated redis-exporter service.
+  - job_name: 'redis-exporter'
+    static_configs:
+      - targets: ['redis-exporter:9121'] # 'redis-exporter' is the service name, 9121 is its default port.
+
+  # --- PostgreSQL Exporter Metrics ---
+  # Scrapes metrics about the PostgreSQL database from the dedicated postgres-exporter service.
+  - job_name: 'postgres-exporter'
+    static_configs:
+      - targets: ['postgres-exporter:9187'] # 'postgres-exporter' is the service name, 9187 is its default port.
