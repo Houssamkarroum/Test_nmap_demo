@@ -148,7 +148,7 @@ if __name__ == "__main__":
     # For a real-world scenario, this should be the actual internal network you wish to scan.
     # Based on your 'ip addr show' output and discussion, '192.168.75.0/24' is your Wi-Fi network.
     # Using this range will make the simulation relevant to your local environment.
-    target_network = '192.168.75.0/24' # Example: Your local Wi-Fi network segment.
+    target_network = '192.0.2.0/24' # Example: Your local Wi-Fi network segment.
 
     # Defines the size of each scanning task (IP segment) that workers will process.
     # A /29 segment contains 8 IP addresses (typically 6 usable hosts for scanning).
