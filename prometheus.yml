@@ -1,54 +1,36 @@
 # prometheus.yml
-# This is the configuration file for the Prometheus server.
-# It defines scrape jobs to collect metrics from various services in your Docker Compose setup.
-
-# Global Prometheus configuration.
 global:
-  scrape_interval: 15s # Default scrape interval for all jobs.
-  evaluation_interval: 15s # How often rules are evaluated.
+  scrape_interval: 5s # How frequently to scrape targets
 
-# Rule files for alerting (not used in this basic PoC, but good to know).
-rule_files:
-  # - "first_rules.yml"
-  # - "second_rules.yml"
-
-# A list of scrape configurations. Each configuration defines a set of targets
-# and how Prometheus should scrape metrics from them.
 scrape_configs:
-  # --- Prometheus's own metrics ---
-  - job_name: 'prometheus'
-    # Default target for Prometheus itself (its own metrics endpoint).
-    static_configs:
-      - targets: ['localhost:9090']
-
-  # --- Orchestrator Application Metrics ---
-  # Scrapes custom application metrics exposed by the orchestrator service.
+  # Orchestrator metrics
   - job_name: 'orchestrator'
-    # Targets are dynamically discovered based on the 'orchestrator' service in Docker Compose.
-    # Prometheus will look for containers named 'poc_orchestrator' or similar.
-    # The 'orchestrator' service is defined in docker-compose.yml, and Prometheus
-    # can resolve 'orchestrator' to its internal IP.
     static_configs:
-      - targets: ['orchestrator:8000'] # 'orchestrator' is the service name, 8000 is the metrics port.
+      - targets: ['orchestrator:8000'] # Matches the orchestrator service name and port from docker-compose.yml
 
-  # --- Worker Application Metrics ---
-  # Scrapes custom application metrics exposed by each worker service instance.
-  # Since there are multiple worker replicas, Prometheus automatically discovers them
-  # by targeting the 'worker' service name. Docker's internal DNS will load-balance
-  # or provide IPs for all instances.
+  # Worker metrics
   - job_name: 'worker'
     static_configs:
-      - targets: ['worker:8001'] # 'worker' is the service name, 8001 is the metrics port.
-                                 # Prometheus will scrape all instances exposed on this port.
+      - targets: ['worker:8001'] # Prometheus will resolve 'worker' to all IPs of scaled worker containers on port 8001
+    relabel_configs:
+      # This relabel config ensures each worker instance has a distinct label.
+      # Docker Compose automatically appends `_1`, `_2`, etc. to container names when scaling.
+      # __meta_docker_container_name holds the full container name (e.g., poc_worker_1)
+      - source_labels: [__meta_docker_container_name]
+        regex: 'poc_worker_([0-9]+)' # Extracts the numerical ID (e.g., '1', '2', '3') from "poc_worker_X"
+        target_label: worker_id # Create a new label named 'worker_id'
+        replacement: '$1' # Use the extracted ID as the label value
+      # The default 'instance' label will typically be the IP:Port (e.g., 172.18.0.4:8001)
+      # This relabeling effectively keeps it that way, if desired.
+      - source_labels: [__address__]
+        target_label: instance
 
-  # --- Redis Exporter Metrics ---
-  # Scrapes metrics about the Redis server from the dedicated redis-exporter service.
+  # Redis Exporter metrics
   - job_name: 'redis-exporter'
     static_configs:
-      - targets: ['redis-exporter:9121'] # 'redis-exporter' is the service name, 9121 is its default port.
+      - targets: ['redis-exporter:9121']
 
-  # --- PostgreSQL Exporter Metrics ---
-  # Scrapes metrics about the PostgreSQL database from the dedicated postgres-exporter service.
+  # Postgres Exporter metrics
   - job_name: 'postgres-exporter'
     static_configs:
-      - targets: ['postgres-exporter:9187'] # 'postgres-exporter' is the service name, 9187 is its default port.
+      - targets: ['postgres-exporter:9187']

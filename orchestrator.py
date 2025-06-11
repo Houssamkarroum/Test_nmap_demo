@@ -1,138 +1,396 @@
-# orchestrator.py
-# This script acts as the central coordinator for the distributed scanning system.
-# It's responsible for network decomposition, task generation, and task distribution to Redis.
-#
-# Key Features:
-# - Robust Redis connection with retry and exponential backoff.
-# - Network decomposition into smaller, manageable IP segments.
-# - Task packaging with comprehensive metadata (task_id, phase, retries, timestamp).
-# - Efficient task distribution to Redis using RPUSH.
-# - Prometheus metrics exposition for monitoring its operations.
+import os
+import redis
+import ipcalc
+import time
+import psycopg2
+from psycopg2 import extras
+from datetime import datetime
+import json
+import logging
+from prometheus_client import start_http_server, Gauge, Counter
 
-import redis          # Python client for Redis, used for task queuing.
-import ipaddress      # Standard library for IP address manipulation (network decomposition).
-import time           # For delays and timestamps.
-import sys            # For system exit.
-import json           # For JSON serialization of tasks.
-import logging        # For structured logging throughout the script.
-import os             # For accessing environment variables for configuration.
-from prometheus_client import start_http_server, Gauge, Counter # Prometheus client library for metrics.
-
-# --- Configuration ---
-# Redis connection details, retrieved from environment variables set by Docker Compose.
-# Defaults are provided for local testing outside of a Docker Compose environment.
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-REDIS_DB = 0 # Default Redis database index.
-
-# Prometheus metrics port, retrieved from environment variables.
-# This is the port on which the orchestrator will expose its metrics for Prometheus to scrape.
-PROMETHEUS_METRICS_PORT = int(os.getenv('PROMETHEUS_METRICS_PORT', 8000))
-
-# Configure basic logging for better visibility of orchestrator operations.
-# Logs will be printed to standard output, visible in 'docker-compose logs orchestrator'.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Global Redis connection object, initialized once and reused.
-redis_client = None
+# --- Prometheus Metrics ---
+JOBS_ENQUEUED = Counter('orchestrator_jobs_enqueued_total', 'Total jobs enqueued by orchestrator', ['network_segment', 'phase'])
+JOBS_COMPLETED = Counter('orchestrator_jobs_completed_total', 'Total jobs completed by orchestrator', ['network_segment', 'phase'])
+CURRENT_QUEUED_JOBS = Gauge('orchestrator_current_queued_jobs', 'Current number of jobs in Redis queue')
+CURRENT_PROCESSING_JOBS = Gauge('orchestrator_current_processing_jobs', 'Current number of jobs being processed by workers')
+DB_CONNECTION_STATUS = Gauge('orchestrator_db_connection_status', 'Status of DB connection (1=up, 0=down)')
+ORCHESTRATOR_ERRORS = Counter('orchestrator_errors_total', 'Total errors encountered by orchestrator')
 
-# --- Prometheus Metrics Definitions ---
-# These are the custom metrics exposed by the orchestrator application.
-# Gauges represent a value that can go up and down (e.g., queue size).
-# Counters represent a monotonically increasing value (e.g., total tasks pushed).
+# --- Configuration from Environment Variables ---
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis') # Default to 'redis' service name
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_DB = 0
 
-# Counter: Total number of scan tasks successfully pushed to Redis.
-tasks_pushed_total = Counter(
-    'orchestrator_tasks_pushed_total',
-    'Total number of scan tasks pushed to the Redis queue by the orchestrator.'
-)
+POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'postgres') # Default to 'postgres' service name
+POSTGRES_DB = os.getenv('POSTGRES_DB', 'nmap_results')
+POSTGRES_USER = os.getenv('POSTGRES_USER', 'nmap_user')
+POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'nmap_password')
 
-# Gauge: Current number of tasks pending in the Redis queue.
-# This metric is updated by the orchestrator after pushing tasks and periodically (or when checked).
-redis_queue_size = Gauge(
-    'orchestrator_redis_queue_size',
-    'Current number of tasks in the Redis scan_queue.'
-)
+PROMETHEUS_METRICS_PORT = int(os.getenv('PROMETHEUS_METRICS_PORT', 8000))
+
+# --- Global Redis Client (with robust connection) ---
+redis_client = None # Renamed to avoid clash with 'r' in original code
+SCAN_QUEUE = "scan_queue"
+COMPLETED_QUEUE = "completed_scans" # Not directly used in enqueuing but good to have
+PROCESSING_JOBS_LIST = "processing_jobs" # Not directly used in enqueuing but good to have
 
 def get_redis_client():
-    """
-    Establishes and returns a robust Redis client connection.
-    Includes reconnection logic with retries and exponential backoff to handle
-    transient network issues or Redis not being immediately available (e.g., on startup).
-    """
+    """Establishes and returns a robust Redis client connection."""
     global redis_client
-    # If client is already connected and responsive, return it.
     if redis_client is not None:
         try:
-            # Ping Redis to ensure the connection is still alive.
             redis_client.ping()
             return redis_client
         except redis.exceptions.ConnectionError:
             logging.warning("Existing Redis connection lost. Attempting to reconnect...")
-            redis_client = None # Force a new connection attempt.
+            redis_client = None
 
-    # Attempt to establish a new connection with retries.
-    retries = 10 # Number of retry attempts.
-    for attempt in range(retries):
+    max_retries = 10
+    for attempt in range(max_retries):
         try:
-            logging.info(f"Attempting to connect to Redis at {REDIS_HOST}:{REDIS_PORT}... (Attempt {attempt + 1}/{retries})")
-            client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_connect_timeout=5)
-            client.ping() # Sends a PING command to verify the connection.
+            logging.info(f"Attempting to connect to Redis at {REDIS_HOST}:{REDIS_PORT}... (Attempt {attempt + 1}/{max_retries})")
+            client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_connect_timeout=5, decode_responses=True)
+            client.ping()
             logging.info("Successfully connected to Redis.")
-            redis_client = client # Store the successful connection globally.
+            redis_client = client
             return redis_client
         except redis.exceptions.ConnectionError as e:
             logging.warning(f"Redis connection failed: {e}. Retrying in {2**attempt} seconds...")
-            time.sleep(2**attempt) # Exponential backoff to avoid hammering the service.
+            time.sleep(2**attempt)
         except Exception as e:
-            logging.error(f"An unexpected error occurred during Redis connection attempt: {e}. Retrying...")
-            time.sleep(2**attempt) # Still use exponential backoff for other errors.
+            logging.error(f"An unexpected error during Redis connection: {e}. Retrying...")
+            time.sleep(2**attempt)
+    logging.critical("Failed to connect to Redis after multiple retries. Orchestrator cannot operate without Redis. Exiting.")
+    sys.exit(1)
 
-    logging.critical("Failed to connect to Redis after multiple retries. Orchestrator cannot proceed. Exiting.")
-    sys.exit(1) # Critical failure: orchestrator cannot function without Redis.
 
-def generate_ip_segments(network_range_str, segment_prefix_length):
-    """
-    Divides a larger IP network range into smaller, manageable segments.
-    Each segment will become a distinct task for a worker. This function
-    implements the "Décomposition du Réseau" phase by the orchestrator.
+# --- Global PostgreSQL Connection ---
+postgres_conn = None
 
-    Arguments:
-        network_range_str (str): The overall target network range (e.g., '10.0.0.0/8').
-        segment_prefix_length (int): The desired prefix length for the smaller segments
-                                     (e.g., 29 for /29 blocks, which contain 8 IPs).
+def get_db_connection():
+    """Establishes and returns a PostgreSQL database connection."""
+    global postgres_conn
+    if postgres_conn is not None:
+        try:
+            # Check if the connection is still alive
+            with postgres_conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            DB_CONNECTION_STATUS.set(1)
+            return postgres_conn
+        except psycopg2.OperationalError:
+            logging.warning("Existing PostgreSQL connection lost. Attempting to reconnect...")
+            postgres_conn = None
+        except Exception:
+            logging.warning("Existing PostgreSQL connection in unknown state. Attempting to reconnect...")
+            postgres_conn = None
 
-    Returns:
-        list: A list of network strings (e.g., '10.0.0.0/29', '10.0.0.8/29').
-              Returns an empty list if there's an error or invalid input.
-    """
-    segments = []
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Attempting to connect to PostgreSQL at {POSTGRES_HOST}... (Attempt {attempt + 1}/{max_retries})")
+            conn = psycopg2.connect(
+                host=POSTGRES_HOST,
+                database=POSTGRES_DB,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASSWORD,
+                connect_timeout=5
+            )
+            conn.autocommit = True # For simplicity, commit immediately
+            logging.info("Successfully connected to PostgreSQL.")
+            postgres_conn = conn
+            DB_CONNECTION_STATUS.set(1)
+            return postgres_conn
+        except psycopg2.OperationalError as e:
+            logging.warning(f"PostgreSQL connection failed: {e}. Retrying in {2**attempt} seconds...")
+            time.sleep(2**attempt)
+        except Exception as e:
+            logging.error(f"An unexpected error during PostgreSQL connection: {e}. Retrying...")
+            time.sleep(2**attempt)
+    logging.critical("Failed to connect to PostgreSQL after multiple retries. Orchestrator cannot function without DB. Exiting.")
+    sys.exit(1)
+
+def init_db_tables():
+    """Initializes the PostgreSQL database tables if they don't exist."""
+    conn = get_db_connection()
     try:
-        network = ipaddress.ip_network(network_range_str, strict=False)
-        # Validate that the segment_prefix_length is greater than the input network's prefix length.
-        # This ensures we are breaking down a larger network into smaller subnets.
-        if segment_prefix_length <= network.prefixlen:
-            logging.error(f"Error: Segment prefix length ({segment_prefix_length}) must be strictly "
-                          f"greater than the target network prefix length ({network.prefixlen}). "
-                          f"Cannot decompose '{network_range_str}' into smaller segments with this prefix.")
-            return []
+        with conn.cursor() as cur:
+            # Table for scan results (same as worker's)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scan_results (
+                    id SERIAL PRIMARY KEY,
+                    ip_address VARCHAR(45) NOT NULL,  -- Increased for IPv6 support
+                    port INT,
+                    service VARCHAR(50),
+                    service_version VARCHAR(100),
+                    os_detection VARCHAR(100),
+                    scan_segment VARCHAR(50),         -- Increased for longer CIDR notations
+                    scan_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_ip_port
+                ON scan_results (ip_address, port);
+            """)
 
-        # Use the subnets() method to generate all subnets of the specified new_prefix.
-        for subnet in network.subnets(new_prefix=segment_prefix_length):
-            segments.append(str(subnet))
-    except ValueError as e:
-        logging.error(f"Error: Invalid network range '{network_range_str}' or segment prefix length {segment_prefix_length}. Details: {e}")
-        return []
+            # Table to track scan jobs managed by the orchestrator
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scan_jobs (
+                    job_id SERIAL PRIMARY KEY,
+                    network_segment VARCHAR(20) UNIQUE NOT NULL,
+                    current_phase VARCHAR(50) NOT NULL,
+                    status VARCHAR(50) NOT NULL, -- e.g., 'pending', 'in_progress', 'completed', 'failed'
+                    attempts INT DEFAULT 0,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                );
+            """)
+            conn.commit()
+            logging.info("Database tables 'scan_results' and 'scan_jobs' ensured/created successfully.")
     except Exception as e:
-        logging.error(f"An unexpected error occurred during IP segment generation: {e}", exc_info=True)
+        logging.critical(f"Error initializing database tables: {e}. Orchestrator will exit.", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
+        sys.exit(1)
+
+def update_job_status(cursor, network_segment, phase, status, attempts_increment=0, completed_at=None):
+    """Updates the status of a scan job in the database."""
+    query = """
+    INSERT INTO scan_jobs (network_segment, current_phase, status, attempts, started_at, last_updated_at, completed_at)
+    VALUES (%s, %s, %s, %s, NOW(), NOW(), %s)
+    ON CONFLICT (network_segment) DO UPDATE SET
+        current_phase = EXCLUDED.current_phase,
+        status = EXCLUDED.status,
+        attempts = scan_jobs.attempts + %s, -- Increment attempts by the given value
+        last_updated_at = NOW(),
+        completed_at = EXCLUDED.completed_at
+    RETURNING job_id;
+    """
+    try:
+        cursor.execute(query, (network_segment, phase, status, attempts_increment, completed_at, attempts_increment))
+        job_id = cursor.fetchone()[0]
+        logging.info(f"DB: Updated job {network_segment} ({phase}) to {status}. Job ID: {job_id}")
+        return job_id
+    except Exception as e:
+        logging.error(f"DB Error updating job status for {network_segment} ({phase}): {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
+        return None
+
+def get_job_details(cursor, network_segment):
+    """Fetches details for a specific network segment job."""
+    query = "SELECT job_id, network_segment, current_phase, status, attempts, started_at, last_updated_at, completed_at FROM scan_jobs WHERE network_segment = %s;"
+    try:
+        cursor.execute(query, (network_segment,))
+        return cursor.fetchone()
+    except Exception as e:
+        logging.error(f"DB Error fetching job details for {network_segment}: {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
+        return None
+
+def get_active_hosts_in_segment(cursor, network_segment):
+    """Counts active hosts found in a given network segment from scan_results."""
+    # This query counts IPs within the segment that have at least one port entry,
+    # indicating they were found active and scanned.
+    query = """
+    SELECT COUNT(DISTINCT ip_address) FROM scan_results
+    WHERE scan_segment = %s;
+    """
+    try:
+        cursor.execute(query, (network_segment,))
+        return cursor.fetchone()[0]
+    except Exception as e:
+        logging.error(f"DB Error counting active hosts for {network_segment}: {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
+        return 0
+
+def divide_network_into_chunks(network_range, chunk_size="/29"):
+    """
+    Divides a given network range into smaller chunks.
+    Corrected to iterate through all subnets.
+    """
+    chunks = []
+    try:
+        network = ipcalc.Network(network_range)
+        for subnet in network:
+            if str(subnet.mask) == chunk_size:
+                chunks.append(str(subnet))
+            elif str(subnet.mask) < chunk_size:
+                # If the input network is larger than chunk_size, iterate through subnets
+                for sub_subnet in ipcalc.Network(str(subnet) + chunk_size):
+                    chunks.append(str(sub_subnet))
+            else: # If chunk_size is smaller than input mask, just add the input (should ideally not happen with common inputs)
+                chunks.append(str(subnet))
+
+    except Exception as e:
+        logging.error(f"Error dividing network {network_range}: {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
         return []
-    return segments
+    return sorted(list(set(chunks))) # Return sorted unique chunks
+
+def enqueue_scan_job(network_segment, phase, attempt=1):
+    """
+    Enqueues a job to Redis with proper JSON formatting and updates its status in DB.
+    """
+    r_client = get_redis_client() # Get the robust Redis client
+    conn = get_db_connection()    # Get the robust DB connection
+
+    task_data = {
+        "segment": network_segment,
+        "task_id": f"{network_segment}-{phase}-{int(time.time())}-{attempt}", # Unique task ID
+        "phase": phase,
+        "retries": attempt - 1 # How many times this specific task has been retried
+    }
+    task_json_str = json.dumps(task_data)
+
+    try:
+        r_client.lpush(SCAN_QUEUE, task_json_str)
+        JOBS_ENQUEUED.labels(network_segment=network_segment, phase=phase).inc()
+
+        with conn.cursor() as cursor:
+            # Update job status in DB: increment attempts only if it's not the first attempt for this phase
+            update_job_status(cursor, network_segment, phase, 'in_progress', attempts_increment=1)
+
+        logging.info(f"Enqueued task for segment: {network_segment}, Phase: {phase}, Task ID: {task_data['task_id']}")
+
+    except (redis.exceptions.RedisError, psycopg2.Error) as e:
+        logging.error(f"Failed to enqueue job or update DB for {network_segment} ({phase}): {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc()
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during enqueueing for {network_segment} ({phase}): {e}", exc_info=True)
+        ORCHESTRATOR_ERRETS.inc()
+
+def orchestrate_scan_phases(conn, initial_segments):
+    """
+    Main orchestration loop. Manages job lifecycle and enqueues tasks based on status.
+    This simplified version focuses on the 'discovery_and_portscan' phase.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+        for segment in initial_segments:
+            job_details = get_job_details(cursor, segment)
+
+            if job_details:
+                # Job exists, check its status
+                current_phase = job_details['current_phase']
+                status = job_details['status']
+
+                if status == 'completed':
+                    logging.info(f"Segment {segment} already completed. Skipping.")
+                    continue
+                elif status == 'in_progress':
+                    logging.info(f"Segment {segment} is already in progress ({current_phase}). Will monitor.")
+                    # In a real system, you might check last_updated_at and re-enqueue if stuck
+                    continue
+                elif status == 'failed':
+                    logging.warning(f"Segment {segment} previously failed ({current_phase}). Consider re-enqueuing or manual intervention.")
+                    # For now, let's re-enqueue to retry, but with an incremented attempt count
+                    enqueue_scan_job(segment, current_phase, job_details['attempts'] + 1)
+                    continue
+                elif status == 'pending':
+                    # If it's pending, enqueue it.
+                    logging.info(f"Segment {segment} is pending. Enqueuing for initial scan.")
+                    enqueue_scan_job(segment, 'discovery_and_portscan', 1) # Start phase 1
+                    continue
+            else:
+                # New job, insert into DB and enqueue for initial scan
+                logging.info(f"New segment {segment}. Enqueuing for initial scan.")
+                update_job_status(cursor, segment, 'pending', 'pending', attempts_increment=0) # Mark as pending first
+                enqueue_scan_job(segment, 'discovery_and_portscan', 1) # Then enqueue
+
+        # After initial enqueuing, monitor the queue and update metrics
+        r_client = get_redis_client()
+        current_queued_jobs = r_client.llen(SCAN_QUEUE)
+        CURRENT_QUEUED_JOBS.set(current_queued_jobs)
+        logging.info(f"Current Redis queue size: {current_queued_jobs}")
+
+        # This part simulates processing jobs. In a real system, workers would
+        # consume from SCAN_QUEUE, and potentially push to a 'results' or 'completed' queue
+        # or directly update DB. Here, we just monitor.
+        # For simplicity in this PoC, we assume jobs are processed once enqueued
+        # and rely on the worker updating the DB for 'completed' status.
+        # So, the orchestrator periodically queries DB to see status.
+
+        # Example of how the orchestrator would "know" about completed jobs:
+        # It would need a way to receive completion signals, or regularly poll DB.
+        # Let's add a basic polling loop to check status.
+        logging.info("Orchestrator entering monitoring loop. Press Ctrl+C to exit.")
+        while True:
+            # Poll DB for jobs in 'in_progress' state to check if they're actually completed
+            # This is a simple check, a more robust system might use a separate 'results' queue
+            # or rely on workers pushing job IDs to a 'completed' list.
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                    cur.execute("SELECT network_segment, current_phase FROM scan_jobs WHERE status = 'in_progress';")
+                    in_progress_jobs = cur.fetchall()
+
+                    for job in in_progress_jobs:
+                        segment = job['network_segment']
+                        # Check if this segment now has results in scan_results table
+                        active_hosts_count = get_active_hosts_in_segment(cur, segment)
+                        # A simple heuristic: if active hosts are found, consider the scan "done" for this phase
+                        # In a real system, you'd have more robust completion criteria (e.g., specific messages from worker)
+                        if active_hosts_count > 0:
+                            logging.info(f"Orchestrator detected completion of scan for {segment}. Updating status to 'completed'.")
+                            update_job_status(cur, segment, job['current_phase'], 'completed', completed_at=datetime.now())
+                            JOBS_COMPLETED.labels(network_segment=segment, phase=job['current_phase']).inc()
+
+            except Exception as e:
+                logging.error(f"Error during orchestrator monitoring loop: {e}", exc_info=True)
+                ORCHESTRATOR_ERRORS.inc()
+
+            # Update queue metrics periodically
+            try:
+                r_client = get_redis_client() # Re-get in case of connection issues
+                current_queued_jobs = r_client.llen(SCAN_QUEUE)
+                CURRENT_QUEUED_JOBS.set(current_queued_jobs)
+                # For processing jobs, a more sophisticated mechanism is needed (e.g., workers reporting 'started' status)
+                # For now, we'll keep it simple and assume processing = not in queue and not completed
+                CURRENT_PROCESSING_JOBS.set(len(in_progress_jobs)) # Approximation based on DB status
+
+            except redis.exceptions.RedisError as e:
+                logging.warning(f"Redis error while updating queue metrics: {e}")
+                ORCHESTRATOR_ERRORS.inc()
+            except Exception as e:
+                logging.warning(f"An unexpected error occurred while updating metrics: {e}", exc_info=True)
+                ORCHESTRATOR_ERRORS.inc()
+
+            time.sleep(5) # Wait before next check
+
+def enqueue_scan_job(network_segment, phase, attempt=1):
+    """
+    Enqueues a job to Redis with proper JSON formatting and updates its status in DB.
+    """
+    r_client = get_redis_client() # Get the robust Redis client
+    conn = get_db_connection()    # Get the robust DB connection
+
+    task_data = {
+        "segment": network_segment,
+        "task_id": f"{network_segment}-{phase}-{int(time.time())}-{attempt}", # Unique task ID
+        "phase": phase,
+        "retries": attempt - 1 # How many times this specific task has been retried
+    }
+    task_json_str = json.dumps(task_data)
+
+    try:
+        r_client.lpush(SCAN_QUEUE, task_json_str) # Correctly using SCAN_QUEUE
+        JOBS_ENQUEUED.labels(network_segment=network_segment, phase=phase).inc()
+
+        with conn.cursor() as cursor:
+            # Update job status in DB: increment attempts only if it's not the first attempt for this phase
+            update_job_status(cursor, network_segment, phase, 'in_progress', attempts_increment=1)
+
+        logging.info(f"Enqueued task for segment: {network_segment}, Phase: {phase}, Task ID: {task_data['task_id']}")
+
+    except (redis.exceptions.RedisError, psycopg2.Error) as e:
+        logging.error(f"Failed to enqueue job or update DB for {network_segment} ({phase}): {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc() # Corrected name
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during enqueueing for {network_segment} ({phase}): {e}", exc_info=True)
+        ORCHESTRATOR_ERRORS.inc() # Corrected name
 
 if __name__ == "__main__":
-    logging.info("Orchestrator starting...")
-
-    # Start Prometheus HTTP server for metrics exposition.
-    # Metrics will be available at http://<orchestrator_ip>:<PROMETHEUS_METRICS_PORT>/metrics
+    logging.info(f"Orchestrator starting. Metrics Port: {PROMETHEUS_METRICS_PORT}")
     try:
         start_http_server(PROMETHEUS_METRICS_PORT)
         logging.info(f"Prometheus metrics exposed on port {PROMETHEUS_METRICS_PORT}")
@@ -140,96 +398,28 @@ if __name__ == "__main__":
         logging.critical(f"Failed to start Prometheus HTTP server on port {PROMETHEUS_METRICS_PORT}: {e}. Exiting.", exc_info=True)
         sys.exit(1)
 
-    r_client = get_redis_client() # Obtain a robust Redis client connection.
+    init_db_tables() # Initialize orchestrator's DB tables (scan_jobs)
+    # The worker's init_db will handle scan_results table
 
-    # --- Target Network Configuration ---
-    # !! IMPORTANT !!
-    # This is the network range your workers will simulate scanning.
-    # For a real-world scenario, this should be the actual internal network you wish to scan.
-    # Based on your 'ip addr show' output and discussion, '192.168.75.0/24' is your Wi-Fi network.
-    # Using this range will make the simulation relevant to your local environment.
-    target_network = '192.0.2.0/24' # Example: Your local Wi-Fi network segment.
+    # Define the initial network segments to scan
+    # For testing, you might just use one or two.
+    # If using a /8 or /16, divide_network_into_chunks will split it into /24s.
+    # Example: '192.168.1.0/24' will result in ['192.168.1.0/24']
+    # Example: '10.0.0.0/16' with '/24' chunk_size would yield 256 /24 chunks.
+    INITIAL_SCAN_RANGES = [os.getenv('INITIAL_SCAN_RANGE', '192.168.1.0/24')]
+    CHUNKS = []
+    for r_range in INITIAL_SCAN_RANGES:
+        CHUNKS.extend(divide_network_into_chunks(r_range, chunk_size="/29"))
 
-    # Defines the size of each scanning task (IP segment) that workers will process.
-    # A /29 segment contains 8 IP addresses (typically 6 usable hosts for scanning).
-    # This choice balances task granularity with efficiency.
-    segment_task_prefix_length = 29
-
-    # Generate the list of IP segments. This is the "Décomposition du Réseau" part.
-    segments_to_scan = generate_ip_segments(target_network, segment_task_prefix_length)
-    if not segments_to_scan:
-        logging.critical("No segments generated. Orchestrator cannot proceed without tasks. Exiting.")
+    if not CHUNKS:
+        logging.critical("No valid IP segments to scan. Please check INITIAL_SCAN_RANGE. Exiting.")
         sys.exit(1)
 
-    logging.info(f"Generated {len(segments_to_scan)} segments (each a /{segment_task_prefix_length} block) from the target network {target_network}.")
+    logging.info(f"Orchestrator will manage {len(CHUNKS)} IP segments: {CHUNKS}")
 
-    # --- Redis Queue Management ---
-    # Clear any previous tasks from the Redis queue to ensure a clean slate for the current scan.
-    try:
-        r_client.delete('scan_queue') # Deletes the Redis list named 'scan_queue'.
-        logging.info("Cleared previous 'scan_queue' in Redis to start fresh.")
-    except redis.exceptions.RedisError as e:
-        logging.error(f"Error clearing Redis queue: {e}. This might mean old tasks persist. Attempting to proceed anyway.", exc_info=True)
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while clearing Redis queue: {e}. Attempting to proceed anyway.", exc_info=True)
-
-    # Push each generated segment as a structured task onto the Redis queue.
-    # This is the "Empaquetage du Travail" (Work Packaging) and distribution to the "File Redis" phase.
-    for i, segment in enumerate(segments_to_scan):
-        # Data Format in Redis: JSON-serialized dictionary
-        # Each task is a dictionary containing the IP segment and crucial metadata.
-        # This allows for a flexible and extensible task definition.
-        task_data = {
-            "segment": segment,                 # The IP network segment to be scanned.
-            "task_id": f"task_{i:05d}",         # A unique identifier for this specific task (e.g., task_00001).
-            "phase": "discovery_and_portscan",  # Indicates the current scanning phase for the worker.
-                                                # For this PoC, we combine discovery and port scan.
-            "retries": 0,                       # Counter for how many times this task has been retried due to worker errors.
-            "priority": "normal",               # Can be used for prioritization (e.g., "high", "low").
-            "created_at": time.time()           # Unix timestamp when the task was created.
-        }
-        # Serialize the Python dictionary into a JSON string.
-        # Redis stores strings, so JSON serialization is necessary for structured data.
-        task_json = json.dumps(task_data)
-
-        try:
-            r_client.rpush('scan_queue', task_json) # Adds the JSON task string to the right end of the Redis list.
-            tasks_pushed_total.inc() # Increment the Prometheus counter for each task pushed.
-            # Use logging.debug instead of info if you want less verbose output during task pushing.
-            # logging.debug(f"Pushed task (ID: {task_data['task_id']}) for segment: {segment} to scan queue.")
-        except redis.exceptions.RedisError as e:
-            logging.error(f"Error pushing task {task_json} to Redis: {e}. This task might be lost.", exc_info=True)
-            # In a production system, you might implement a dedicated retry mechanism for pushing tasks
-            # or a fallback to a persistent storage if Redis is down.
-
-    logging.info(f"All {len(segments_to_scan)} tasks have been successfully pushed to Redis.")
-
-    # Update the Redis queue size gauge after all tasks have been pushed.
-    try:
-        current_queue_size = r_client.llen('scan_queue')
-        redis_queue_size.set(current_queue_size)
-        logging.info(f"Redis scan_queue size updated to {current_queue_size}.")
-    except redis.exceptions.RedisError as e:
-        logging.error(f"Error getting Redis queue length for metrics: {e}", exc_info=True)
-
-
-    logging.info("The orchestrator has completed its task generation and distribution role.")
-    logging.info("\nTo observe the workers in action and monitor the system, view the Docker Compose logs:")
-    logging.info("  docker-compose logs -f")
-    logging.info("Access Prometheus at http://localhost:9090 and Grafana at http://localhost:3000 to see metrics and scan results.")
-
-    # The orchestrator will now stay alive to continue exposing its metrics via the HTTP server.
-    # In a real-world scenario, you might have it run periodically or listen for external triggers.
-    # For this PoC, it just generates tasks once and then remains idle but exposes metrics.
-    # If the orchestrator is meant to be a one-shot process, you might remove the start_http_server
-    # and let it exit, or add a long sleep here if metrics are desired for a while.
-    while True:
-        # Update queue size periodically even if not pushing new tasks, for up-to-date metric.
-        try:
-            current_queue_size = r_client.llen('scan_queue')
-            redis_queue_size.set(current_queue_size)
-        except redis.exceptions.RedisError:
-            logging.warning("Failed to update Redis queue size metric (connection issue?).")
-            # Attempt to re-establish Redis connection if ping fails in the next loop.
-            get_redis_client()
-        time.sleep(30) # Update queue size metric every 30 seconds.
+    orchestrator_db_conn = get_db_connection() # Get DB connection for orchestration
+    if orchestrator_db_conn:
+        orchestrate_scan_phases(orchestrator_db_conn, CHUNKS)
+    else:
+        logging.critical("Orchestrator failed to get a database connection. Cannot proceed.")
+        sys.exit(1)

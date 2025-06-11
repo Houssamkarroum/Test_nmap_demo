@@ -1,86 +1,73 @@
-# worker.py
-# This script defines the behavior of a single distributed scanning worker.
-# Each worker pulls tasks from Redis, simulates network scans, and stores results in PostgreSQL.
-#
-# Key Features:
-# - Robust Redis and PostgreSQL connections with retry and exponential backoff.
-# - Multithreaded simulated host discovery and port scanning.
-# - Efficient storage of scan results into PostgreSQL with ON CONFLICT DO UPDATE handling.
-# - Prometheus metrics exposition for granular monitoring of worker performance.
-
-import os               # For accessing environment variables and process ID.
-import time             # For delays and timestamps.
-import redis            # Python client for Redis.
+import os
+import time
+import redis
 import sys
-import random           # For simulating random scan outcomes.
-import psycopg2         # PostgreSQL adapter for Python.
-import ipaddress        # For IP address and network manipulation.
-from concurrent.futures import ThreadPoolExecutor, as_completed # For multithreaded scanning.
-import json             # For JSON deserialization of tasks.
-import logging          # For structured logging.
-from psycopg2 import OperationalError, Error # Specific PostgreSQL error types.
-from redis.exceptions import ConnectionError as RedisConnectionError, RedisError # Specific Redis error types.
-from prometheus_client import start_http_server, Gauge, Counter # Prometheus client library for metrics.
+import random
+import psycopg2
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import logging
+from psycopg2 import OperationalError, Error
+from redis.exceptions import ConnectionError as RedisConnectionError, RedisError
+from prometheus_client import start_http_server, Gauge, Counter
 
-# Configure logging for the worker, outputting to standard output.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [Worker %(process)d] - %(message)s')
 
 # --- Configuration from Environment Variables ---
-# These variables are set by Docker Compose in docker-compose.yml.
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis') # Default to 'redis' service name
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 REDIS_DB = 0
 
-POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
+POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'postgres') # Default to 'postgres' service name
 POSTGRES_DB = os.getenv('POSTGRES_DB', 'nmap_results')
 POSTGRES_USER = os.getenv('POSTGRES_USER', 'nmap_user')
 POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'nmap_password')
 
 # Number of threads each worker will use for concurrent scanning simulations.
-# This directly impacts the worker's processing speed and demonstrates parallelism.
 WORKER_THREADS = int(os.getenv('WORKER_THREADS', 10))
 
-# Prometheus metrics port, retrieved from environment variables.
-# Each worker instance will expose its metrics on this port.
+# --- DYNAMIC WORKER_ID AND PROMETHEUS_METRICS_PORT ---
+# Use the Docker HOSTNAME (which is the container ID or service_name-replica_number)
+# to derive a unique WORKER_ID for each scaled worker instance.
+WORKER_ID = os.getenv('WORKER_ID', os.getenv('HOSTNAME', 'unknown_worker'))
+
+# All worker containers will expose metrics on this internal port.
 PROMETHEUS_METRICS_PORT = int(os.getenv('PROMETHEUS_METRICS_PORT', 8001))
 
 # Global connection objects for Redis and PostgreSQL.
-# These are managed to ensure persistent and robust connections.
 redis_client = None
 postgres_conn = None
 
 # --- Prometheus Metrics Definitions ---
-# These are the custom metrics exposed by each worker instance.
-
-# Counter: Total number of IP segments successfully processed by this worker.
 segments_processed_total = Counter(
     'worker_segments_processed_total',
-    'Total number of IP segments successfully processed by this worker.'
+    'Total number of IP segments successfully processed by this worker.',
+    ['worker_id']
 )
 
-# Counter: Total number of active hosts discovered by this worker.
 hosts_active_total = Counter(
     'worker_hosts_active_total',
-    'Total number of active hosts discovered by this worker.'
+    'Total number of active hosts discovered by this worker.',
+    ['worker_id']
 )
 
-# Counter: Total number of ports/services scanned and found by this worker.
 ports_scanned_total = Counter(
     'worker_ports_scanned_total',
-    'Total number of open ports/services found by this worker.'
+    'Total number of open ports/services found by this worker.',
+    ['worker_id']
 )
 
-# Counter: Total number of errors encountered by this worker during task processing or DB operations.
 worker_errors_total = Counter(
     'worker_errors_total',
-    'Total number of errors encountered by this worker.'
+    'Total number of errors encountered by this worker.',
+    ['worker_id']
 )
 
-# Gauge: The current number of tasks available in the Redis scan_queue, as seen by this worker.
-# This provides visibility into the shared queue from the worker's perspective.
 redis_queue_size_worker_view = Gauge(
     'worker_redis_queue_size',
-    'Current number of tasks in the Redis scan_queue (worker view).'
+    'Current number of tasks in the Redis scan_queue (worker view).',
+    ['worker_id']
 )
 
 def get_redis_client():
@@ -89,22 +76,20 @@ def get_redis_client():
     Implements reconnection logic with exponential backoff.
     """
     global redis_client
-    # Check if an existing connection is active and responsive.
     if redis_client is not None:
         try:
             redis_client.ping()
             return redis_client
         except RedisConnectionError:
             logging.warning("Existing Redis connection lost. Attempting to reconnect...")
-            redis_client = None # Force a new connection attempt.
+            redis_client = None
 
-    # Attempt to establish a new connection with retries.
     max_retries = 10
     for attempt in range(max_retries):
         try:
             logging.info(f"Attempting to connect to Redis at {REDIS_HOST}:{REDIS_PORT}... (Attempt {attempt + 1}/{max_retries})")
             client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_connect_timeout=5)
-            client.ping() # Test the connection.
+            client.ping()
             logging.info("Successfully connected to Redis.")
             redis_client = client
             return redis_client
@@ -116,7 +101,7 @@ def get_redis_client():
             time.sleep(2**attempt)
 
     logging.critical("Failed to connect to Redis after multiple retries. Worker cannot operate without Redis. Exiting.")
-    sys.exit(1) # Critical failure: worker cannot function without Redis.
+    sys.exit(1)
 
 def get_postgres_connection():
     """
@@ -124,21 +109,18 @@ def get_postgres_connection():
     Includes reconnection logic with exponential backoff.
     """
     global postgres_conn
-    # Check if an existing connection is active and healthy.
     if postgres_conn is not None:
         try:
-            # Check connection status, psycopg2.OperationalError indicates a bad connection.
             with postgres_conn.cursor() as cur:
-                cur.execute("SELECT 1") # Simple query to test connection.
+                cur.execute("SELECT 1")
             return postgres_conn
         except OperationalError:
             logging.warning("Existing PostgreSQL connection lost. Attempting to reconnect...")
-            postgres_conn = None # Force a new connection attempt.
+            postgres_conn = None
         except Exception:
             logging.warning("Existing PostgreSQL connection in unknown state. Attempting to reconnect...")
             postgres_conn = None
 
-    # Attempt to establish a new connection with retries.
     max_retries = 10
     for attempt in range(max_retries):
         try:
@@ -148,7 +130,7 @@ def get_postgres_connection():
                 database=POSTGRES_DB,
                 user=POSTGRES_USER,
                 password=POSTGRES_PASSWORD,
-                connect_timeout=5 # Timeout for the connection attempt itself.
+                connect_timeout=5
             )
             logging.info("Successfully connected to PostgreSQL.")
             postgres_conn = conn
@@ -161,220 +143,285 @@ def get_postgres_connection():
             time.sleep(2**attempt)
 
     logging.critical("Failed to connect to PostgreSQL after multiple retries. Worker cannot store results. Exiting.")
-    sys.exit(1) # Critical failure: worker cannot function without a database connection.
+    sys.exit(1)
 
 def init_db():
     """
     Initializes the PostgreSQL database table (`scan_results`) if it doesn't exist.
-    This ensures the table structure is ready when the worker attempts to insert data.
+    Adds new columns for service version and OS detection.
     """
     conn = get_postgres_connection()
     try:
         cur = conn.cursor()
-        # Create the 'scan_results' table to store discovered hosts, ports, and services.
-        # This table design supports the basic requirements for storing scan outputs.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scan_results (
-                id SERIAL PRIMARY KEY,              -- Unique identifier for each scan result entry.
-                ip_address VARCHAR(15) NOT NULL,    -- The IPv4 address of the discovered host.
-                port INT,                           -- The port number of the discovered service.
-                service VARCHAR(50),                -- A descriptive name for the service (e.g., 'HTTP', 'SSH').
-                scan_segment VARCHAR(20),           -- The original IP segment (e.g., '10.0.0.0/29') this result came from.
-                scan_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- Timestamp of the discovery/last update.
+                id SERIAL PRIMARY KEY,
+                ip_address VARCHAR(45) NOT NULL,  -- Increased for IPv6 support
+                port INT,
+                service VARCHAR(50),
+                service_version VARCHAR(100),
+                os_detection VARCHAR(100),
+                scan_segment VARCHAR(50),         -- Increased for longer CIDR notations
+                scan_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Create a unique index on 'ip_address' and 'port'.
-        # This prevents duplicate entries for the same service on the same host.
-        # 'ON CONFLICT DO UPDATE' handles updates gracefully if a duplicate is inserted,
-        # updating the 'service' and 'scan_timestamp' fields, which is useful for re-scans.
+        # Ensure unique index still works, and update ON CONFLICT for new columns
+        # (This index is sufficient, ON CONFLICT will handle updates)
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_ip_port
             ON scan_results (ip_address, port);
         """)
-        conn.commit() # Commit the transaction to make changes permanent.
+        conn.commit()
         cur.close()
         logging.info("Database table 'scan_results' ensured/created successfully.")
     except Error as e:
         logging.critical(f"Error initializing database table: {e}. Worker will exit.", exc_info=True)
-        worker_errors_total.inc() # Increment error metric on DB init failure.
-        sys.exit(1) # If table creation fails, the worker cannot store data, so it should exit.
+        worker_errors_total.labels(worker_id=WORKER_ID).inc()
+        sys.exit(1)
     except Exception as e:
         logging.critical(f"An unexpected error occurred during DB initialization: {e}. Worker will exit.", exc_info=True)
-        worker_errors_total.inc()
+        worker_errors_total.labels(worker_id=WORKER_ID).inc()
         sys.exit(1)
 
-def simulate_ping(ip_address):
-    """
-    Simulates a network ping or host discovery process for a single IP address.
-    In a real Nmap scenario, this would involve 'nmap -sn <ip>' or similar host discovery techniques.
-    Returns the IP address if it's considered 'active', otherwise returns None.
-    Simulates network latency and varying success rates.
-    """
-    time.sleep(random.uniform(0.1, 0.5)) # Simulate variable network latency and processing time.
-    # Simulate an active host with a 25% probability for a more dynamic simulation.
-    is_active = random.choice([True, False, False, False])
-    if is_active:
-        logging.debug(f"  Host {ip_address} is active (simulated).")
-    return ip_address if is_active else None
+import subprocess
+import xml.etree.ElementTree as ET
 
-def simulate_port_scan(ip_address):
+def nmap_discover_hosts(ip_segment):
     """
-    Simulates a port and service scan for a single active host.
-    In a real Nmap scenario, this would involve 'nmap -p- -sV <ip>' to detect open ports and identify services.
-    Returns a list of dictionaries, where each dictionary represents a discovered service (IP, port, service name).
+    Uses nmap to discover live hosts in the segment with multiple detection methods.
     """
-    discovered_services = []
-    # A mapping of common ports to their typical services for realistic simulation.
-    common_ports = {
-        22: "SSH", 80: "HTTP", 443: "HTTPS", 3389: "RDP", 21: "FTP", 23: "Telnet",
-        25: "SMTP", 53: "DNS", 135: "RPC", 139: "NetBIOS", 445: "SMB", 1433: "MSSQL",
-        1521: "Oracle", 3306: "MySQL", 5432: "PostgreSQL", 5985: "WinRM", 8080: "HTTP-Alt"
-    }
+    try:
+        # More aggressive host discovery:
+        # -PE: ICMP Echo
+        # -PP: ICMP Timestamp
+        # -PS: TCP SYN to common ports
+        # -n: No DNS resolution (faster)
+        result = subprocess.run(
+            ["sudo", "nmap", "-PE", "-PP", "-PS21,22,23,25,80,443,3389", 
+             "-n", "--max-retries", "2", "-oX", "-", ip_segment],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180  # Increased timeout
+        )
+        if result.returncode != 0:
+            logging.error(f"nmap host discovery failed: {result.stderr.decode()}")
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
+            return []
 
-    # Simulate finding between 0 and 3 open ports on a given active host.
-    num_open_ports = random.randint(0, 3)
-    if num_open_ports > 0:
-        # Randomly select a subset of common ports to be "open" on this host.
-        open_ports_info = random.sample(list(common_ports.items()), k=num_open_ports)
-        for port, service_name in open_ports_info:
-            time.sleep(random.uniform(0.05, 0.2)) # Simulate scan time per port, adding to realism.
-            discovered_services.append({'ip': ip_address, 'port': port, 'service': service_name})
-            logging.debug(f"    Found {ip_address}:{port} ({service_name})")
-    else:
-        logging.debug(f"    No common open ports found on {ip_address}.")
+        xml_root = ET.fromstring(result.stdout)
+        hosts = []
+        for host in xml_root.findall("host"):
+            status = host.find("status")
+            addr = host.find("address")
+            if (status is not None and 
+                status.attrib.get("state") == "up" and 
+                addr is not None and 
+                addr.attrib.get("addrtype") == "ipv4"):
+                hosts.append(addr.attrib["addr"])
+        if hosts:
+            hosts_count = len(hosts)
+            hosts_active_total.labels(worker_id=WORKER_ID).inc(hosts_count)
+            logging.info(f"Found {hosts_count} active hosts in segment {ip_segment}")
+        else:
+            logging.warning(f"No hosts found in segment {ip_segment} - verify network connectivity")
+        return hosts
+        
+        
 
-    return discovered_services
+    except Exception as e:
+        logging.error(f"Exception during nmap_discover_hosts: {e}", exc_info=True)
+        worker_errors_total.labels(worker_id=WORKER_ID).inc()
+        return []
+
+def nmap_os_and_ports(ip):
+    """Basic nmap port scan for common ports only."""
+    try:
+        scan_results = []
+        result = subprocess.run(
+            ["sudo", "nmap", "-sS", "--top-ports", "100", 
+             "-n", "--max-retries", "1", "-T4", "-oX", "-", ip],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90
+        )
+
+        if result.returncode != 0:
+            logging.warning(f"nmap scan failed for {ip}: {result.stderr.decode()}")
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
+            return []
+
+        xml_root = ET.fromstring(result.stdout)
+        host = xml_root.find("host")
+        if host is None:
+            logging.warning(f"No host information found for {ip}")
+            return []
+
+        # Get ports/services
+        ports_elem = host.find("ports")
+        if ports_elem is not None:
+            for port in ports_elem.findall("port"):
+                state = port.find("state")
+                if state is not None and state.attrib.get("state") == "open":
+                    service = port.find("service")
+                    port_info = {
+                        "ip": ip,
+                        "port": int(port.attrib["portid"]),
+                        "service": service.attrib.get("name") if service is not None else "unknown",
+                        "service_version": None,
+                        "os_detection": None
+                    }
+                    scan_results.append(port_info)
+
+        # If no open ports found, still create a record for the host
+        if not scan_results:
+            # Create a record with port 0 to indicate host is alive but no open ports
+            host_record = {
+                "ip": ip,
+                "port": 0,  # Use port 0 to indicate "host alive, no open ports"
+                "service": "host_alive",
+                "service_version": None,
+                "os_detection": None
+            }
+            scan_results.append(host_record)
+            logging.info(f"Host {ip} is alive but no open ports found")
+        else:
+            ports_count = len(scan_results)
+            ports_scanned_total.labels(worker_id=WORKER_ID).inc(ports_count)
+            logging.info(f"Found {ports_count} open ports for {ip}")
+        
+        return scan_results
+
+    except Exception as e:
+        logging.error(f"Exception during nmap_os_and_ports for {ip}: {e}", exc_info=True)
+        worker_errors_total.labels(worker_id=WORKER_ID).inc()
+        return []
 
 def process_segment(ip_segment):
-    """
-    Main function for a worker to process a given IP segment.
-    This function orchestrates the multi-phase scanning simulation (host discovery and port scanning)
-    and leverages multithreading for concurrent operations within the worker.
-    """
-    logging.info(f"Starting processing for segment: {ip_segment}")
+    """Process a network segment."""
+    logging.info(f"Starting scan for segment: {ip_segment}")
+    
+    # First discover hosts
+    active_hosts_ips = nmap_discover_hosts(ip_segment)
+    if not active_hosts_ips:
+        logging.warning(f"No active hosts in segment {ip_segment}")
+        return [], 0
 
-    active_hosts = []
-    all_ips_in_segment = []
-    try:
-        network = ipaddress.ip_network(ip_segment, strict=False)
-        # Get all usable host IP addresses within the segment, excluding network and broadcast.
-        all_ips_in_segment = [str(ip) for ip in network.hosts()]
-    except ValueError as e:
-        logging.error(f"Invalid IP segment received: {ip_segment}. Error: {e}")
-        worker_errors_total.inc() # Increment error metric on invalid segment.
-        return [] # Return empty if the segment string is malformed.
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while parsing segment {ip_segment}: {e}", exc_info=True)
-        worker_errors_total.inc()
-        return []
+    segments_processed_total.labels(worker_id=WORKER_ID).inc()
+    # Then scan each host
+    final_results = []
+    successful_scans = 0
+    failed_scans = 0
 
-    if not all_ips_in_segment:
-        logging.info(f"No usable IPs in segment {ip_segment}. Skipping scan for this segment.")
-        return []
-
-    # 1. Host Discovery Phase (Simulated Nmap -sn / ping scan)
-    # Using ThreadPoolExecutor to concurrently 'ping' all IPs within the assigned segment.
-    logging.info(f"Starting host discovery for {len(all_ips_in_segment)} IPs in {ip_segment} using {WORKER_THREADS} threads.")
-    with ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
-        # Submit simulate_ping tasks for each IP address in the segment.
-        future_to_ip = {executor.submit(simulate_ping, ip): ip for ip in all_ips_in_segment}
+    with ThreadPoolExecutor(max_workers=min(WORKER_THREADS, len(active_hosts_ips))) as executor:
+        future_to_ip = {executor.submit(nmap_os_and_ports, ip): ip for ip in active_hosts_ips}
         for future in as_completed(future_to_ip):
             ip = future_to_ip[future]
             try:
-                result_ip = future.result()
-                if result_ip:
-                    active_hosts.append(result_ip)
+                host_results = future.result()
+                if host_results:
+                    final_results.extend(host_results)
+                    successful_scans += 1
+                    # Check if it's just a "host alive" record
+                    if len(host_results) == 1 and host_results[0].get('port') == 0:
+                        logging.info(f"Host {ip} recorded as alive with no open ports")
+                    else:
+                        logging.info(f"Host {ip} scanned with {len(host_results)} open ports")
+                else:
+                    failed_scans += 1
+                    logging.warning(f"Scan completely failed for {ip}")
             except Exception as exc:
-                logging.error(f"Host discovery failed for {ip}: {exc}", exc_info=True)
-                worker_errors_total.inc() # Increment error metric on ping failure.
+                failed_scans += 1
+                logging.error(f"Scan failed for {ip}: {exc}")
+                worker_errors_total.labels(worker_id=WORKER_ID).inc()
 
-    logging.info(f"Discovered {len(active_hosts)} active hosts in segment {ip_segment}.")
-    hosts_active_total.inc(len(active_hosts)) # Increment Prometheus counter for active hosts.
+    logging.info(f"Segment {ip_segment} complete: {successful_scans} successful, {failed_scans} failed")
+    return final_results, len(active_hosts_ips)
 
-    # 2. Port and Service Scanning Phase (Simulated Nmap -p -sV)
-    # Using ThreadPoolExecutor again to concurrently scan ports on each discovered active host.
-    all_discovered_services = []
-    if active_hosts:
-        logging.info(f"Starting port/service scan for {len(active_hosts)} active hosts in {ip_segment} using {WORKER_THREADS} threads.")
-        with ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
-            # Submit simulate_port_scan tasks for each active host.
-            future_to_host = {executor.submit(simulate_port_scan, host): host for host in active_hosts}
-            for future in as_completed(future_to_host):
-                host = future_to_host[future]
-                try:
-                    services = future.result()
-                    all_discovered_services.extend(services)
-                except Exception as exc:
-                    logging.error(f"Port scan generated an exception for host {host}: {exc}", exc_info=True)
-                    worker_errors_total.inc() # Increment error metric on port scan failure.
-    else:
-        logging.info(f"No active hosts discovered in {ip_segment} to perform port scans on.")
-
-    ports_scanned_total.inc(len(all_discovered_services)) # Increment Prometheus counter for discovered services.
-    return all_discovered_services
 
 def store_results_in_db(results, segment):
     """
-    Stores the collected scan results (discovered services) into the PostgreSQL database.
-    Implements retry logic for database operations to enhance robustness.
+    Stores the collected scan results (discovered services with versions and OS)
+    into the PostgreSQL database.
     """
+    # Unpack results tuple if needed
+    if isinstance(results, tuple):
+        results, _ = results  # Unpack (results, active_hosts_count)
+
     if not results:
         logging.info(f"No results to store for segment {segment}.")
         return
 
     conn = None
-    max_retries = 3 # Max attempts to store results.
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            conn = get_postgres_connection() # Get a fresh or existing healthy connection.
+            conn = get_postgres_connection()
             cur = conn.cursor()
 
-            # Prepare data for bulk insertion. This is more efficient than individual INSERT statements.
             insert_values = []
             for res in results:
-                # Ensure all required keys exist, providing defaults if necessary to prevent errors.
-                ip = res.get('ip')
-                port = res.get('port')
-                service = res.get('service')
-                if ip and port is not None: # Ensure IP and port are valid.
-                    insert_values.append((ip, port, service, segment))
-                else:
-                    logging.warning(f"Skipping malformed result: {res} from segment {segment}")
+                try:
+                    # Handle both dictionary and list formats
+                    if isinstance(res, dict):
+                        ip = res.get('ip')
+                        port = res.get('port')
+                        service = res.get('service') or None 
+                        service_version = res.get('service_version') or None
+                        os_detection = res.get('os_detection') or None
+                    elif isinstance(res, (list, tuple)):
+                        # Assuming the list/tuple follows the same order as the DB columns
+                        ip = res[0] if len(res) > 0 else None
+                        port = res[1] if len(res) > 1 else None
+                        service = res[2] if len(res) > 2 else None
+                        service_version = res[3] if len(res) > 3 else None
+                        os_detection = res[4] if len(res) > 4 else None
+                    else:
+                        logging.warning(f"Skipping invalid result type {type(res)}: {res}")
+                        continue
+
+                    if ip and port is not None:
+                        insert_values.append((ip, port, service, service_version, os_detection, segment))
+                    else:
+                        logging.warning(f"Skipping incomplete result: {res}")
+                except Exception as e:
+                    logging.warning(f"Error processing result {res}: {e}")
+                    continue
 
             if not insert_values:
-                logging.info(f"No valid results to insert after filtering for segment {segment}.")
+                logging.info(f"No valid results to insert for segment {segment}.")
                 return
 
-            # Execute the bulk insertion.
-            # ON CONFLICT (ip_address, port) DO UPDATE ensures that if an entry for the same IP and port
-            # already exists, it is updated (service name, timestamp) instead of causing a unique constraint error.
+            # Execute the bulk insertion
             cur.executemany(
                 """
-                INSERT INTO scan_results (ip_address, port, service, scan_segment)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO scan_results (ip_address, port, service, service_version, os_detection, scan_segment)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ip_address, port) DO UPDATE
-                SET service = EXCLUDED.service, scan_timestamp = CURRENT_TIMESTAMP;
+                SET service = EXCLUDED.service,
+                    service_version = EXCLUDED.service_version,
+                    os_detection = EXCLUDED.os_detection,
+                    scan_timestamp = CURRENT_TIMESTAMP;
                 """,
                 insert_values
             )
 
-            conn.commit() # Commit the transaction to save changes to the database.
+            conn.commit()
             cur.close()
-            logging.info(f"Successfully stored {len(insert_values)} service entries for segment {segment} in PostgreSQL.")
-            return # Exit function on successful storage.
-        except OperationalError as e:
-            logging.error(f"PostgreSQL operational error storing results for {segment} (Attempt {attempt+1}/{max_retries}): {e}")
-            worker_errors_total.inc() # Increment error metric on DB operational error.
+            logging.info(f"Successfully stored {len(insert_values)} service entries for segment {segment}.")
+            return
+
+        except Exception as e:
+            logging.error(f"Error storing results for {segment} (Attempt {attempt+1}/{max_retries}): {e}", exc_info=True)
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
             if conn:
-                conn.rollback() # Rollback the transaction on error to prevent partial writes.
+                conn.rollback()
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt) # Exponential backoff before retrying.
-                logging.info(f"Retrying PostgreSQL insertion for {segment}...")
+                time.sleep(2 ** attempt)
             else:
-                logging.critical(f"Failed to store results for {segment} after multiple retries due to operational error. Data might be lost.")
+                logging.critical(f"Failed to store results for {segment} after multiple retries. Data might be lost.")
         except Error as e:
             logging.error(f"A general PostgreSQL error occurred storing results for {segment} (Attempt {attempt+1}/{max_retries}): {e}", exc_info=True)
-            worker_errors_total.inc() # Increment error metric on general DB error.
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
             if conn:
                 conn.rollback()
             if attempt < max_retries - 1:
@@ -383,7 +430,7 @@ def store_results_in_db(results, segment):
                 logging.critical(f"Failed to store results for {segment} after multiple retries due to a general DB error. Data might be lost.")
         except Exception as e:
             logging.error(f"An unexpected error occurred while storing results for {segment} (Attempt {attempt+1}/{max_retries}): {e}", exc_info=True)
-            worker_errors_total.inc() # Increment error metric on unexpected error.
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
             if conn:
                 conn.rollback()
             if attempt < max_retries - 1:
@@ -392,10 +439,9 @@ def store_results_in_db(results, segment):
                 logging.critical(f"Failed to store results for {segment} after multiple retries due to unexpected error. Data might be lost.")
 
 if __name__ == "__main__":
-    worker_pid = os.getpid() # Get the process ID of the worker for unique logging.
-    logging.info(f"Worker process starting with {WORKER_THREADS} threads.")
+    worker_pid = os.getpid()
+    logging.info(f"Worker process starting with {WORKER_THREADS} threads. WORKER_ID: {WORKER_ID}, Metrics Port: {PROMETHEUS_METRICS_PORT}")
 
-    # Start Prometheus HTTP server for metrics exposition for this worker instance.
     try:
         start_http_server(PROMETHEUS_METRICS_PORT)
         logging.info(f"Prometheus metrics exposed on port {PROMETHEUS_METRICS_PORT}")
@@ -403,85 +449,87 @@ if __name__ == "__main__":
         logging.critical(f"Failed to start Prometheus HTTP server on port {PROMETHEUS_METRICS_PORT}: {e}. Exiting.", exc_info=True)
         sys.exit(1)
 
-    # Initialize database connection and ensure table schema is ready.
     init_db()
-    # Initialize Redis connection.
     r_client = get_redis_client()
 
-    # Main worker loop: continuously pull tasks from Redis and process them.
+    # The main worker loop
     while True:
         try:
-            # Block and wait for a task from the Redis queue using BLPOP (blocking left pop).
-            # The timeout ensures the worker doesn't hang indefinitely if the queue is empty,
-            # allowing it to periodically check for shutdown signals or gracefully exit.
-            # 'task_raw' will be (queue_name, task_data_bytes) or None if timeout occurs.
-            task_raw = r_client.blpop('scan_queue', timeout=15) # Shorter timeout to update queue size metric more frequently.
+            # BLPOP blocks until a task is available or timeout occurs
+            # 'scan_queue' is the name of your Redis list
+            task_raw = r_client.blpop('scan_queue', timeout=15)
 
-            # Update the Redis queue size metric from the worker's perspective.
+            # Update queue size metric regardless of whether a task was found
             try:
                 current_queue_size = r_client.llen('scan_queue')
-                redis_queue_size_worker_view.set(current_queue_size)
+                redis_queue_size_worker_view.labels(worker_id=WORKER_ID).set(current_queue_size)
             except RedisError:
                 logging.warning("Failed to update Redis queue size metric (connection issue?).")
-                # Connection error might be handled by get_redis_client() in the next loop.
 
             if task_raw:
-                task_json_str = task_raw[1].decode('utf-8') # Decode the byte string from Redis.
+                # task_raw is a tuple: (queue_name, task_data_bytes)
+                task_json_str = task_raw[1].decode('utf-8')
+                
                 try:
-                    # Data Format: JSON-serialized dictionary.
-                    # Deserialize the JSON string back into a Python dictionary.
+                    # Parse the JSON string into a Python dictionary
                     task_data = json.loads(task_json_str)
-                    segment = task_data.get("segment") # Extract the IP segment.
-                    # Extract other metadata for logging or conditional processing.
+                    
+                    # Extract data directly from the dictionary (THIS IS THE KEY CHANGE)
+                    segment = task_data.get("segment")
                     task_id = task_data.get("task_id", "N/A")
                     phase = task_data.get("phase", "unknown")
-                    retries = task_data.get("retries", 0)
+                    retries = task_data.get("retries", 0) # Use .get() with a default for robustness
+
 
                     if not segment:
                         logging.warning(f"Received task (ID: {task_id}) from Redis with no 'segment' key. Skipping malformed task: {task_json_str}")
-                        worker_errors_total.inc() # Increment error metric for malformed tasks.
-                        continue # Skip to the next iteration to get a new task.
+                        worker_errors_total.labels(worker_id=WORKER_ID).inc()
+                        continue
 
                     logging.info(f"Picked up task (ID: {task_id}) for segment: {segment} (Phase: {phase}, Retries: {retries}).")
 
-                    # --- Main Task Processing Logic ---
-                    # The worker's behavior can be adapted based on the 'phase' metadata.
-                    # For this PoC, 'discovery_and_portscan' is the primary phase.
                     if phase == "discovery_and_portscan":
-                        # Perform the simulated host discovery and port scan for the given segment.
-                        discovered_services = process_segment(segment)
-                        # Store the collected results into the PostgreSQL database.
-                        store_results_in_db(discovered_services, segment)
-                        segments_processed_total.inc() # Increment Prometheus counter for processed segments.
+                        try:
+                            scan_results, active_hosts_count = process_segment(segment)
+                            
+                            if active_hosts_count > 0:
+                                if scan_results:
+                                    store_results_in_db(scan_results, segment)
+                                    logging.info(f"Stored {len(scan_results)} results for {active_hosts_count} hosts in {segment}")
+                                else:
+                                    logging.info(f"Found {active_hosts_count} hosts but no open ports in {segment}")
+                            else:
+                                logging.info(f"No active hosts found in segment {segment}")
+                            
+                            segments_processed_total.labels(worker_id=WORKER_ID).inc()
+                            
+                        except Exception as e:
+                            logging.error(f"Error processing segment {segment}: {e}", exc_info=True)
+                            worker_errors_total.labels(worker_id=WORKER_ID).inc()
                     else:
                         logging.warning(f"Unknown or unhandled phase '{phase}' for task ID {task_id}. Skipping processing.")
-                        worker_errors_total.inc() # Increment error metric for unhandled phases.
+                        worker_errors_total.labels(worker_id=WORKER_ID).inc()
 
                     logging.info(f"Finished processing task (ID: {task_id}) for segment: {segment}.")
 
                 except json.JSONDecodeError as e:
                     logging.error(f"Error decoding JSON task from Redis: {e}. Raw task data: {task_json_str}", exc_info=True)
-                    worker_errors_total.inc() # Increment error metric for JSON decode errors.
-                    # A malformed JSON task indicates a data issue; it's best to skip it.
+                    worker_errors_total.labels(worker_id=WORKER_ID).inc()
                 except Exception as e:
+                    # Catch any other unexpected errors during task processing
                     logging.error(f"An unexpected error occurred while processing task (ID: {task_id}) for segment {segment}: {e}", exc_info=True)
-                    worker_errors_total.inc() # Increment error metric for general task processing errors.
-                    # In a production system, you might implement a task re-queuing strategy here:
-                    # Increment task_data["retries"] and r_client.rpush('scan_queue', json.dumps(task_data))
-                    # Or move it to a "dead-letter queue" if retries exceed a certain limit to prevent infinite loops.
+                    worker_errors_total.labels(worker_id=WORKER_ID).inc()
 
             else:
-                # If blpop times out (no tasks in queue), log that and continue waiting.
-                # The worker stays alive to expose metrics and wait for new tasks.
                 logging.debug("No tasks in queue (timeout). Waiting for new tasks...")
-                # No 'break' here, as workers should continuously run and wait for tasks.
 
         except RedisConnectionError as e:
             logging.error(f"Lost connection to Redis in main loop: {e}. Attempting to reconnect...")
-            worker_errors_total.inc() # Increment error metric for Redis connection loss.
-            redis_client = None # Force the `get_redis_client` function to re-establish the connection.
-            time.sleep(5) # Pause before attempting to reconnect to avoid busy-looping.
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
+            redis_client = None # Reset client to force reconnection
+            time.sleep(5)
         except Exception as e:
+            # Catch any critical unhandled errors in the main loop itself
             logging.critical(f"A critical unhandled error occurred in the main worker loop: {e}. Worker will pause and retry.", exc_info=True)
-            worker_errors_total.inc() # Increment error metric for critical unhandled errors.
-            time.sleep(10) # Longer pause for critical unhandled errors to prevent rapid crash-restart cycles.
+            worker_errors_total.labels(worker_id=WORKER_ID).inc()
+            time.sleep(10)

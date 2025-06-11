@@ -1,21 +1,11 @@
 # Dockerfile.orchestrator
-# This Dockerfile builds the custom Docker image for the 'orchestrator' service.
-# It sets up the Python environment and copies the orchestrator script into the container.
-
-# Use a lean official Python base image for efficiency.
 FROM python:3.9-slim-buster
 
-# Set the working directory inside the container.
 WORKDIR /app
 
-# Copy the requirements file into the container.
 COPY requirements.txt .
-# Install Python dependencies.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the orchestrator script into the container's working directory.
 COPY orchestrator.py .
 
-# Define the default command to execute when a container starts from this image.
-# This will run your orchestrator.py script, initiating the task generation.
 CMD ["python", "orchestrator.py"]

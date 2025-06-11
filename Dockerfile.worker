@@ -1,25 +1,18 @@
 # Dockerfile.worker
-# This Dockerfile builds the custom Docker image for the 'worker' service.
-# It sets up the Python environment and copies the worker script into the container.
-
-# Use a lean official Python base image for efficiency and smaller image size.
 FROM python:3.9-slim-buster
 
-# Set the working directory inside the container.
-# All subsequent commands (COPY, RUN, CMD) will be executed relative to this directory.
 WORKDIR /app
 
-# Copy the requirements file into the container.
-# This is done before installing to leverage Docker's build cache.
-COPY requirements.txt .
+# Install Nmap and necessary tools
+RUN apt-get update && \
+    apt-get install -y nmap sudo && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo "worker ALL=(ALL) NOPASSWD: /usr/bin/nmap" >> /etc/sudoers
 
-# Install Python dependencies specified in requirements.txt.
-# --no-cache-dir reduces the image size by not storing pip's cache.
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the worker script into the container's working directory.
 COPY worker.py .
 
-# Define the default command to execute when a container starts from this image.
-# This will run your worker.py script, starting the worker process.
+# Command to run the worker script
 CMD ["python", "worker.py"]

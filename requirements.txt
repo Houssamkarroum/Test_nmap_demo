@@ -1,3 +1,6 @@
-redis               
-psycopg2-binary
+redis
+ipcalc
+psycopg2-binary 
 prometheus_client
+six
+requests
